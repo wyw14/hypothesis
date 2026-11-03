@@ -44,6 +44,9 @@ for ex in [
 
 BAD_ARGS.extend([e(st.lists, st.nothing(), unique=True, min_size=1)])
 
+for bad_max_run in (0, -1, 1.5, "no"):
+    BAD_ARGS.append(e(st.lists, st.integers(), max_run=bad_max_run))
+
 test_raise_invalid_argument = argument_validation_test(BAD_ARGS)
 
 

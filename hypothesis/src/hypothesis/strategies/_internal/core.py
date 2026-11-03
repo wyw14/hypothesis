@@ -310,6 +310,7 @@ def lists(
         Callable[[Ex], Hashable] | tuple[Callable[[Ex], Hashable], ...] | None
     ) = None,
     unique: bool = False,
+    max_run: int | None = None,
 ) -> SearchStrategy[list[Ex]]:
     """Returns a list containing values drawn from elements with length in the
     interval [min_size, max_size] (no bounds in that direction if these are
@@ -327,6 +328,16 @@ def lists(
     If ``unique_by`` is a tuple of callables the uniqueness will be respective
     to each callable.
 
+    If ``max_run`` is not None it must be a positive integer. Every maximal
+    run of adjacent equal elements in a generated list will then contain at
+    most ``max_run`` elements, where elements are compared with ``==``. This
+    allows values to repeat at non-adjacent positions without being repeated
+    indefinitely, and the elements do not need to be hashable. The limit is
+    maintained while shrinking as well as during generation; if the element
+    strategy cannot supply enough values that differ from their neighbours to
+    build a list of ``min_size``, this is reported as unsatisfiable rather
+    than producing a list which violates the limit.
+
     For example, the following will produce two columns of integers with both
     columns being unique respectively.
 
@@ -340,6 +351,10 @@ def lists(
     """
     check_valid_sizes(min_size, max_size)
     check_strategy(elements, "elements")
+    if max_run is not None:
+        check_type(int, max_run, "max_run")
+        if max_run < 1:
+            raise InvalidArgument(f"max_run={max_run!r} must be a positive integer")
     if unique:
         if unique_by is not None:
             raise InvalidArgument(
@@ -415,6 +430,7 @@ def lists(
                 min_size=min_size,
                 keys=unique_by,
                 tuple_suffixes=tuple_suffixes,
+                max_run=max_run,
             )
 
         return UniqueListStrategy(
@@ -423,8 +439,9 @@ def lists(
             min_size=min_size,
             keys=unique_by,
             tuple_suffixes=tuple_suffixes,
+            max_run=max_run,
         )
-    return ListStrategy(elements, min_size=min_size, max_size=max_size)
+    return ListStrategy(elements, min_size=min_size, max_size=max_size, max_run=max_run)
 
 
 @cacheable

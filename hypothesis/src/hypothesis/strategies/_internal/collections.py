@@ -182,11 +182,14 @@ class ListStrategy(SearchStrategy[list[Ex]]):
         elements: SearchStrategy[Ex],
         min_size: int = 0,
         max_size: float | int | None = math.inf,
+        max_run: int | None = None,
     ):
         super().__init__()
         self.min_size = min_size or 0
         self.max_size = max_size if max_size is not None else math.inf
         assert 0 <= self.min_size <= self.max_size
+        assert max_run is None or max_run >= 1
+        self.max_run = max_run
         self.average_size = min(
             max(self.min_size * 2, self.min_size + 5),
             0.5 * (self.min_size + self.max_size),
@@ -227,13 +230,51 @@ class ListStrategy(SearchStrategy[list[Ex]]):
             assert self.min_size == 0
             return []
 
+        if self.max_run is None:
+            with cu.many(
+                data,
+                min_size=self.min_size,
+                max_size=self.max_size,
+                average_size=self.average_size,
+            ) as elements:
+                return [data.draw(self.element_strategy) for _ in elements]
+
+        max_run = self.max_run
+        assert max_run is not None
+        result: list[Ex] = []
+
+        # We constrain generation with a filter over the values drawn so far
+        # rather than checking after the fact, so that the run limit is
+        # enforced along the same filtered-redraw path used by unique lists.
+        # The predicate closes over ``result``, so when the shrinker replays
+        # a draw with a (possibly modified) fixed prefix, a value which would
+        # extend a run past ``max_run`` is rejected and the shrunk example
+        # still satisfies the limit.  Equality is tested with == rather than
+        # via a set, so the elements need not be hashable.
+        def run_not_too_long(value: Ex) -> bool:  # type: ignore # covariant type param
+            tail = result[-max_run:]
+            return len(tail) < max_run or any(previous != value for previous in tail)
+
+        filtered = FilteredStrategy(
+            self.element_strategy, conditions=(run_not_too_long,)
+        )
         with cu.many(
             data,
             min_size=self.min_size,
             max_size=self.max_size,
             average_size=self.average_size,
         ) as elements:
-            return [data.draw(self.element_strategy) for _ in elements]
+            for _ in elements:
+                value = filtered.do_filtered_draw(data)
+                if value is filter_not_satisfied:
+                    elements.reject(
+                        f"Aborted test because unable to satisfy {filtered!r}"
+                    )
+                else:
+                    assert not isinstance(value, UniqueIdentifier)
+                    result.append(value)
+        assert self.max_size >= len(result) >= self.min_size
+        return result
 
     def _invert(self, value: Any) -> tuple[ChoiceT, ...]:
         if not isinstance(value, list):
@@ -243,6 +284,16 @@ class ListStrategy(SearchStrategy[list[Ex]]):
                 f"len={len(value)} outside "
                 f"[{self.min_size}, {self.max_size!r}] for {self!r}"
             )
+        if self.max_run is not None:
+            run_length = 1
+            for i in range(1, len(value)):
+                # Plain == so that unhashable elements are supported.
+                run_length = run_length + 1 if value[i - 1] == value[i] else 1
+                if run_length > self.max_run:
+                    raise CannotInvert(
+                        f"{value!r} has more than {self.max_run} adjacent "
+                        f"equal elements in a row for {self!r}"
+                    )
         if self.element_strategy.is_empty:
             # do_draw returns [] without drawing anything
             if value:
@@ -261,9 +312,10 @@ class ListStrategy(SearchStrategy[list[Ex]]):
         return tuple(choices)
 
     def __repr__(self) -> str:
+        max_run = f", max_run={self.max_run:_}" if self.max_run is not None else ""
         return (
             f"{self.__class__.__name__}({self.element_strategy!r}, "
-            f"min_size={self.min_size:_}, max_size={self.max_size:_})"
+            f"min_size={self.min_size:_}, max_size={self.max_size:_}{max_run})"
         )
 
     @overload
@@ -319,8 +371,9 @@ class UniqueListStrategy(ListStrategy[Ex]):
         # other things harder to type
         keys: tuple[Callable[[Ex], Any], ...],
         tuple_suffixes: SearchStrategy[tuple[Ex, ...]] | None,
+        max_run: int | None = None,
     ):
-        super().__init__(elements, min_size, max_size)
+        super().__init__(elements, min_size, max_size, max_run=max_run)
         self.keys = keys
         self.tuple_suffixes = tuple_suffixes
 
@@ -329,6 +382,9 @@ class UniqueListStrategy(ListStrategy[Ex]):
             assert self.min_size == 0
             return []
 
+        # No special handling of self.max_run is needed here: pairwise-unique
+        # elements (or uniqueness keys) imply that no two elements compare
+        # equal, so every run of adjacent equal elements has length one.
         seen_sets: tuple[set[Ex], ...] = tuple(set() for _ in self.keys)
         # actually list[Ex], but if self.tuple_suffixes is present then Ex is a
         # tuple[T, ...] because self.element_strategy is a TuplesStrategy, and
