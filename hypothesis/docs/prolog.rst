@@ -186,6 +186,7 @@
 .. |MultiplexedDatabase| replace:: :class:`~hypothesis.database.MultiplexedDatabase`
 .. |GitHubArtifactDatabase| replace:: :class:`~hypothesis.database.GitHubArtifactDatabase`
 .. |BackgroundWriteDatabase| replace:: :class:`~hypothesis.database.BackgroundWriteDatabase`
+.. |NamespacedDatabase| replace:: :class:`~hypothesis.database.NamespacedDatabase`
 .. |RedisExampleDatabase| replace:: :class:`~hypothesis.extra.redis.RedisExampleDatabase`
 
 .. |is_hypothesis_test| replace:: :func:`~hypothesis.is_hypothesis_test`

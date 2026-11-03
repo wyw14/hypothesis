@@ -38,15 +38,22 @@ from hypothesis.database import (
     GitHubArtifactDatabase,
     InMemoryExampleDatabase,
     MultiplexedDatabase,
+    NamespacedDatabase,
     ReadOnlyDatabase,
     _db_for_path,
+    _decode_key,
+    _encode_key,
     _hash,
     _pack_uleb128,
     _unpack_uleb128,
     choices_from_bytes,
     choices_to_bytes,
 )
-from hypothesis.errors import HypothesisDeprecationWarning, HypothesisWarning
+from hypothesis.errors import (
+    HypothesisDeprecationWarning,
+    HypothesisWarning,
+    InvalidArgument,
+)
 from hypothesis.internal.compat import WINDOWS
 from hypothesis.internal.conjecture.choice import choice_equal
 from hypothesis.stateful import (
@@ -869,6 +876,10 @@ def test_deprecated_example_database_no_args():
             ReadOnlyDatabase(DirectoryBasedExampleDatabase("a")),
         ),
         (
+            NamespacedDatabase(DirectoryBasedExampleDatabase("a"), b"ns"),
+            NamespacedDatabase(DirectoryBasedExampleDatabase("a"), b"ns"),
+        ),
+        (
             GitHubArtifactDatabase("owner1", "repo1"),
             GitHubArtifactDatabase("owner1", "repo1"),
         ),
@@ -888,6 +899,14 @@ def test_database_equal(db1, db2):
         (
             ReadOnlyDatabase(DirectoryBasedExampleDatabase("a")),
             ReadOnlyDatabase(DirectoryBasedExampleDatabase("b")),
+        ),
+        (
+            NamespacedDatabase(DirectoryBasedExampleDatabase("a"), b"ns1"),
+            NamespacedDatabase(DirectoryBasedExampleDatabase("a"), b"ns2"),
+        ),
+        (
+            NamespacedDatabase(DirectoryBasedExampleDatabase("a"), b"ns"),
+            NamespacedDatabase(DirectoryBasedExampleDatabase("b"), b"ns"),
         ),
         (
             GitHubArtifactDatabase("owner1", "repo1"),
@@ -914,3 +933,291 @@ def test_directory_db_removes_empty_dirs(tmp_path):
     db.delete(b"k1", b"v2")
     assert not db._key_path(b"k1").exists()
     assert set(db.fetch(db._metakeys_name)) == set()
+
+
+@pytest.mark.parametrize("namespace", [b"", "", None, 0, bytearray(b"ns")])
+def test_namespaced_database_requires_nonempty_bytes_namespace(namespace):
+    with pytest.raises(InvalidArgument):
+        NamespacedDatabase(InMemoryExampleDatabase(), namespace)
+
+
+@given(namespace=st.binary(min_size=1), key=st.binary())
+def test_encode_key_roundtrips(namespace, key):
+    encoded = _encode_key(namespace, key)
+    assert _decode_key(namespace, encoded) == key
+
+
+@given(
+    namespace1=st.binary(min_size=1),
+    namespace2=st.binary(min_size=1),
+    key=st.binary(),
+)
+def test_encode_key_isolated_between_namespaces(namespace1, namespace2, key):
+    encoded = _encode_key(namespace1, key)
+    if namespace1 == namespace2:
+        assert _decode_key(namespace2, encoded) == key
+    else:
+        assert _decode_key(namespace2, encoded) is None
+
+
+@given(encoded=st.binary())
+def test_decode_key_never_raises(encoded):
+    # the underlying database may contain arbitrary keys we did not write
+    decoded = _decode_key(b"namespace", encoded)
+    assert decoded is None or isinstance(decoded, bytes)
+
+
+def test_namespaced_database_isolates_save_fetch_delete_move():
+    shared = InMemoryExampleDatabase()
+    db1 = NamespacedDatabase(shared, b"env-1")
+    db2 = NamespacedDatabase(shared, b"env-2")
+
+    db1.save(b"key", b"value1")
+    db2.save(b"key", b"value2")
+
+    assert set(db1.fetch(b"key")) == {b"value1"}
+    assert set(db2.fetch(b"key")) == {b"value2"}
+    # the underlying database has no entry under the unwrapped key
+    assert set(shared.fetch(b"key")) == set()
+
+    db1.delete(b"key", b"value1")
+    assert set(db1.fetch(b"key")) == set()
+    assert set(db2.fetch(b"key")) == {b"value2"}
+
+    db2.move(b"key", b"other", b"value2")
+    assert set(db2.fetch(b"key")) == set()
+    assert set(db1.fetch(b"other")) == set()
+    assert set(db2.fetch(b"other")) == {b"value2"}
+
+
+@pytest.mark.parametrize(
+    "namespaces",
+    [
+        # prefixes of each other
+        [b"a", b"aa", b"aaa"],
+        # null bytes and prefixes thereof
+        [b"a", b"a\x00", b"a\x00b", b"\x00a", b"\x00", b"\x00\x00"],
+        # bytes which look like our uleb128 length prefixes
+        [b"\x7f", b"\x7f\x80", b"\x80", b"\x01", b"\x01\x01"],
+        [b"x" * 127, b"x" * 128, b"x" * 129],
+    ],
+)
+@pytest.mark.parametrize("key", [b"", b"\x00", b"key", b"\x01\x80\xff"])
+def test_similar_namespaces_cannot_collide(namespaces, key):
+    shared = InMemoryExampleDatabase()
+    dbs = [NamespacedDatabase(shared, ns) for ns in namespaces]
+
+    for i, db in enumerate(dbs):
+        db.save(key, f"value-{i}".encode())
+        # every earlier namespace still reads exactly its own value
+        for j, other in enumerate(dbs[: i + 1]):
+            assert set(other.fetch(key)) == {f"value-{j}".encode()}
+
+    # each namespace maps to a distinct key in the underlying database
+    underlying_keys = {_encode_key(ns, key) for ns in namespaces}
+    assert len(underlying_keys) == len(namespaces)
+    assert set(shared.data) == underlying_keys
+
+    # deleting or moving one namespace's value leaves the others untouched
+    dbs[0].delete(key, b"value-0")
+    assert set(dbs[0].fetch(key)) == set()
+    for i, db in enumerate(dbs[1:], start=1):
+        assert set(db.fetch(key)) == {f"value-{i}".encode()}
+
+    dbs[-1].move(key, b"dest", f"value-{len(dbs) - 1}".encode())
+    for i, db in enumerate(dbs[1:-1], start=1):
+        assert set(db.fetch(key)) == {f"value-{i}".encode()}
+    assert set(dbs[-1].fetch(b"dest")) == {f"value-{len(dbs) - 1}".encode()}
+
+
+@given(st.lists(st.tuples(st.binary(min_size=1), st.binary(), st.binary())))
+@settings(max_examples=50)
+def test_namespaced_database_matches_independent_databases(entries):
+    # An arbitrary sequence of operations over N namespaces on one shared
+    # database must give the same results as N independent databases.
+    shared = InMemoryExampleDatabase()
+    namespaced: dict[bytes, NamespacedDatabase] = {}
+    reference: dict[bytes, dict[bytes, set[bytes]]] = {}
+
+    for namespace, key, value in entries:
+        if namespace not in namespaced:
+            namespaced[namespace] = NamespacedDatabase(shared, namespace)
+            reference[namespace] = {}
+        namespaced[namespace].save(key, value)
+        reference[namespace].setdefault(key, set()).add(value)
+
+    for namespace, keys in reference.items():
+        db = namespaced[namespace]
+        for key, values in keys.items():
+            assert set(db.fetch(key)) == values
+            # direct access to the underlying database cannot see this key
+            assert list(shared.fetch(key)) == []
+
+
+@skipif_threading  # two DirectoryBasedExampleDatabase instances share a path
+def test_namespaced_directory_databases_share_a_directory(tmp_path):
+    db1 = NamespacedDatabase(DirectoryBasedExampleDatabase(tmp_path), b"env-a")
+    db2 = NamespacedDatabase(DirectoryBasedExampleDatabase(tmp_path), b"env-b")
+
+    db1.save(b"key", b"a")
+    db2.save(b"key", b"b")
+
+    assert set(db1.fetch(b"key")) == {b"a"}
+    assert set(db2.fetch(b"key")) == {b"b"}
+
+    db1.delete(b"key", b"a")
+    assert set(db1.fetch(b"key")) == set()
+    assert set(db2.fetch(b"key")) == {b"b"}
+
+
+def test_namespaced_database_listener_only_sees_own_namespace():
+    shared = InMemoryExampleDatabase()
+    db1 = NamespacedDatabase(shared, b"ns1")
+    db2 = NamespacedDatabase(shared, b"ns2")
+
+    events: list = []
+    db1.add_listener(events.append)
+
+    db1.save(b"k", b"v1")
+    db2.save(b"k", b"v2")
+    db1.delete(b"k", b"v1")
+    db2.delete(b"k", b"v2")
+    db1.move(b"a", b"b", b"m")
+
+    assert events == [
+        ("save", (b"k", b"v1")),
+        ("delete", (b"k", b"v1")),
+        ("save", (b"b", b"m")),
+    ]
+
+    # deletes with unknown values are forwarded with the decoded original key
+    encoded = _encode_key(b"ns1", b"k")
+    shared._broadcast_change(("delete", (encoded, None)))
+    assert events[-1] == ("delete", (b"k", None))
+
+    # malformed or foreign keys broadcast directly on the underlying database
+    # are filtered out and never cause errors
+    namespace_prefix = _pack_uleb128(len(b"ns1")) + b"ns1"
+    foreign_encoded = _encode_key(b"ns2", b"k")
+    malformed_keys = [
+        b"",
+        b"\x80",
+        b"\x03ns1",
+        namespace_prefix,
+        namespace_prefix + _pack_uleb128(1) + b"k" + b"junk",
+        _pack_uleb128(4) + b"ns1\x00" + _pack_uleb128(0),
+        foreign_encoded,
+    ]
+    before = list(events)
+    for bad_key in malformed_keys:
+        shared._broadcast_change(("save", (bad_key, b"v")))
+        shared._broadcast_change(("delete", (bad_key, None)))
+    assert events == before
+
+    # removing the listener stops forwarding and unsubscribes from the
+    # underlying database
+    db1.remove_listener(events.append)
+    assert shared._listeners == []
+    db1.save(b"z", b"z")
+    assert events == before
+
+
+def test_namespaced_readonly_database():
+    shared = InMemoryExampleDatabase()
+    namespaced = NamespacedDatabase(ReadOnlyDatabase(shared), b"ns")
+    namespaced.save(b"k", b"v")
+    namespaced.move(b"k", b"k2", b"v")
+    namespaced.delete(b"k", b"v")
+    assert set(namespaced.fetch(b"k")) == set()
+    assert shared.data == {}
+
+    # change listening is still supported (it just never fires)
+    def listener(event):
+        raise AssertionError("ReadOnlyDatabase never fires change events")
+
+    namespaced.add_listener(listener)
+    namespaced.save(b"k2", b"v2")
+
+    # and wrapping a NamespacedDatabase in ReadOnlyDatabase composes too
+    wrapped = ReadOnlyDatabase(NamespacedDatabase(shared, b"ns2"))
+    wrapped.save(b"k", b"v")
+    assert set(wrapped.fetch(b"k")) == set()
+
+
+def test_namespaced_multiplexed_database():
+    a = InMemoryExampleDatabase()
+    b = InMemoryExampleDatabase()
+    multiplexed = MultiplexedDatabase(a, b)
+    db1 = NamespacedDatabase(multiplexed, b"ns1")
+    db2 = NamespacedDatabase(multiplexed, b"ns2")
+
+    db1.save(b"k", b"v")
+    db2.save(b"k", b"w")
+    assert set(db1.fetch(b"k")) == {b"v"}
+    assert set(db2.fetch(b"k")) == {b"w"}
+
+    db1.move(b"k", b"k2", b"v")
+    assert set(db1.fetch(b"k")) == set()
+    assert set(db1.fetch(b"k2")) == {b"v"}
+    assert set(db2.fetch(b"k")) == {b"w"}
+    db1.delete(b"k2", b"v")
+    assert set(db1.fetch(b"k2")) == set()
+    assert set(db2.fetch(b"k")) == {b"w"}
+
+    # listeners on one namespace only see that namespace's events (once per
+    # backing database), reported with the caller's original key and value
+    events: list = []
+    db1.add_listener(events.append)
+    db1.save(b"k3", b"v3")
+    db2.save(b"k3", b"w3")
+    assert Counter(events) == Counter([("save", (b"k3", b"v3"))] * 2)
+
+
+def test_namespaced_background_write_database():
+    backing = BackgroundWriteDatabase(InMemoryExampleDatabase())
+    db1 = NamespacedDatabase(backing, b"ns1")
+    db2 = NamespacedDatabase(backing, b"ns2")
+
+    db1.save(b"k", b"v")
+    db2.save(b"k", b"w")
+    backing._join()
+    assert set(db1.fetch(b"k")) == {b"v"}
+    assert set(db2.fetch(b"k")) == {b"w"}
+
+    events: list = []
+    db1.add_listener(events.append)
+    db1.save(b"k2", b"v2")
+    db2.save(b"k2", b"w2")
+    db1.move(b"k", b"moved", b"v")
+    backing._join()
+
+    assert ("save", (b"k2", b"v2")) in events
+    assert not any(key == b"k2" and value == b"w2" for _, (key, value) in events)
+    assert set(db1.fetch(b"moved")) == {b"v"}
+    assert set(db2.fetch(b"k")) == {b"w"}
+
+    db1.remove_listener(events.append)
+    assert backing._db._listeners == []
+
+
+def test_database_listener_namespaced_memory():
+    _database_conforms_to_listener_api(
+        lambda path: NamespacedDatabase(InMemoryExampleDatabase(), b"namespace"),
+        parent_settings=settings(max_examples=5, stateful_step_count=10),
+    )
+
+
+def test_database_listener_namespaced_background_write():
+    _database_conforms_to_listener_api(
+        lambda path: NamespacedDatabase(
+            BackgroundWriteDatabase(InMemoryExampleDatabase()), b"namespace"
+        ),
+        flush=lambda db: db._db._join(),
+        parent_settings=settings(max_examples=5, stateful_step_count=10),
+    )
+
+
+def test_namespaced_database_repr():
+    db = NamespacedDatabase(InMemoryExampleDatabase(), b"ns")
+    assert "NamespacedDatabase" in repr(db)
+    assert repr(b"ns") in repr(db)

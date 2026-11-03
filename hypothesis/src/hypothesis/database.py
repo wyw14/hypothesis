@@ -36,7 +36,7 @@ from typing import (
 from zipfile import BadZipFile, ZipFile
 
 from hypothesis.configuration import StorageDirectory, storage_directory
-from hypothesis.errors import HypothesisException, HypothesisWarning
+from hypothesis.errors import HypothesisException, HypothesisWarning, InvalidArgument
 from hypothesis.internal.conjecture.choice import ChoiceT
 from hypothesis.utils.conventions import UniqueIdentifier, not_set
 from hypothesis.utils.deprecation import note_deprecation
@@ -46,6 +46,7 @@ __all__ = [
     "ExampleDatabase",
     "GitHubArtifactDatabase",
     "InMemoryExampleDatabase",
+    "NamespacedDatabase",
     "MultiplexedDatabase",
     "ReadOnlyDatabase",
 ]
@@ -1266,6 +1267,123 @@ def _unpack_uleb128(buffer: bytes) -> tuple[int, int]:
         if not byte >> 7:
             break
     return (i + 1, value)
+
+
+def _encode_key(namespace: bytes, key: bytes) -> bytes:
+    # Length-prefix both the namespace and the key. Because uleb128 encodings
+    # are self-terminating, this is an injective encoding of (namespace, key)
+    # pairs, so namespaces which are prefixes of each other, or contain null
+    # bytes, can never collide with each other.
+    return _pack_uleb128(len(namespace)) + namespace + _pack_uleb128(len(key)) + key
+
+
+def _decode_key(namespace: bytes, encoded: bytes) -> bytes | None:
+    """
+    Inverts _encode_key for keys belonging to ``namespace``. Returns None if
+    ``encoded`` belongs to another namespace, or is not one of our encoded
+    keys at all (e.g. a key written directly to the underlying database).
+    """
+    try:
+        ns_offset, ns_len = _unpack_uleb128(encoded)
+        ns_end = ns_offset + ns_len
+        if encoded[ns_offset:ns_end] != namespace:
+            return None
+
+        key_offset, key_len = _unpack_uleb128(encoded[ns_end:])
+        start = ns_end + key_offset
+        end = start + key_len
+        if end != len(encoded):
+            return None
+        return encoded[start:end]
+    except Exception:
+        # the underlying database may contain arbitrary keys that we did not
+        # encode, so be defensive while parsing them.
+        return None
+
+
+class NamespacedDatabase(ExampleDatabase):
+    """A wrapper which isolates the wrapped database in a named namespace.
+
+    Two |NamespacedDatabase| instances wrapping the same underlying database
+    with different namespaces behave as if they were separate databases.
+    ``save``, ``fetch``, ``delete``, and ``move`` only ever see examples
+    written through the same namespace, so multiple independent test
+    environments can share one underlying database without reading or
+    deleting each other's examples.
+
+    ``namespace`` must be a non-empty ``bytes`` value. It is combined with
+    each key using a length-prefixed encoding, which means that namespaces
+    which are prefixes of each other (or contain null bytes) cannot collide.
+
+    Change listeners only receive events for changes in this namespace, and
+    the events use the original keys and values passed to this wrapper.
+
+    This composes with the other database wrappers, for example:
+
+    .. code-block:: python
+
+        shared = DirectoryBasedExampleDatabase(".hypothesis/examples")
+        db = NamespacedDatabase(
+            MultiplexedDatabase(
+                BackgroundWriteDatabase(DirectoryBasedExampleDatabase(local_path)),
+                ReadOnlyDatabase(shared),
+            ),
+            b"my-test-environment",
+        )
+    """
+
+    def __init__(self, db: ExampleDatabase, namespace: bytes) -> None:
+        super().__init__()
+        assert isinstance(db, ExampleDatabase)
+        if not isinstance(namespace, bytes) or not namespace:
+            raise InvalidArgument(
+                f"namespace must be a non-empty bytes object, but got "
+                f"{namespace!r} of type {type(namespace).__name__}"
+            )
+        self._db = db
+        self._namespace = namespace
+
+    def __repr__(self) -> str:
+        return f"NamespacedDatabase({self._db!r}, namespace={self._namespace!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, NamespacedDatabase)
+            and self._db == other._db
+            and self._namespace == other._namespace
+        )
+
+    def _encode(self, key: bytes) -> bytes:
+        return _encode_key(self._namespace, key)
+
+    def fetch(self, key: bytes) -> Iterable[bytes]:
+        yield from self._db.fetch(self._encode(key))
+
+    def save(self, key: bytes, value: bytes) -> None:
+        self._db.save(self._encode(key), value)
+
+    def delete(self, key: bytes, value: bytes) -> None:
+        self._db.delete(self._encode(key), value)
+
+    def move(self, src: bytes, dest: bytes, value: bytes) -> None:
+        self._db.move(self._encode(src), self._encode(dest), value)
+
+    def _forward_change(self, event: ListenerEventT) -> None:
+        event_type, (key, value) = event
+        key = _decode_key(self._namespace, key)
+        if key is None:
+            # a change in another namespace sharing the underlying database
+            return
+        if event_type == "save":
+            self._broadcast_change(("save", (key, cast(bytes, value))))
+        else:
+            self._broadcast_change(("delete", (key, value)))
+
+    def _start_listening(self) -> None:
+        self._db.add_listener(self._forward_change)
+
+    def _stop_listening(self) -> None:
+        self._db.remove_listener(self._forward_change)
 
 
 def choices_to_bytes(choices: Iterable[ChoiceT], /) -> bytes:
