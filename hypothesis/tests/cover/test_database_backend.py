@@ -33,10 +33,13 @@ from hypothesis import (
 )
 from hypothesis.database import (
     BackgroundWriteDatabase,
+    DatabaseComparison,
+    DatabaseComparisonError,
     DirectoryBasedExampleDatabase,
     ExampleDatabase,
     GitHubArtifactDatabase,
     InMemoryExampleDatabase,
+    KeyComparison,
     MultiplexedDatabase,
     ReadOnlyDatabase,
     _db_for_path,
@@ -45,8 +48,13 @@ from hypothesis.database import (
     _unpack_uleb128,
     choices_from_bytes,
     choices_to_bytes,
+    compare_databases,
 )
-from hypothesis.errors import HypothesisDeprecationWarning, HypothesisWarning
+from hypothesis.errors import (
+    HypothesisDeprecationWarning,
+    HypothesisException,
+    HypothesisWarning,
+)
 from hypothesis.internal.compat import WINDOWS
 from hypothesis.internal.conjecture.choice import choice_equal
 from hypothesis.stateful import (
@@ -914,3 +922,364 @@ def test_directory_db_removes_empty_dirs(tmp_path):
     db.delete(b"k1", b"v2")
     assert not db._key_path(b"k1").exists()
     assert set(db.fetch(db._metakeys_name)) == set()
+
+
+class ScriptedExampleDatabase(ExampleDatabase):
+    """An ExampleDatabase with hard-coded fetch contents.
+
+    ``contents`` maps keys to a list of values; the lists may contain
+    duplicates and be in any order. Any mutating or listening operation raises
+    AssertionError, so this database can detect non-read-only use.
+    """
+
+    def __init__(self, contents: dict[bytes, list[bytes]] | None = None) -> None:
+        super().__init__()
+        self.contents = contents or {}
+        self.fetched_keys: list[bytes] = []
+        self.mutating_calls: list[tuple] = []
+
+    def fetch(self, key: bytes) -> Iterable[bytes]:
+        self.fetched_keys.append(key)
+        yield from self.contents.get(key, ())
+
+    def save(self, key: bytes, value: bytes) -> None:
+        self.mutating_calls.append(("save", key, value))
+        raise AssertionError("compare_databases must not call save")
+
+    def delete(self, key: bytes, value: bytes) -> None:
+        self.mutating_calls.append(("delete", key, value))
+        raise AssertionError("CompareDatabase must not call delete")
+
+    def move(self, src: bytes, dest: bytes, value: bytes) -> None:
+        self.mutating_calls.append(("move", src, dest, value))
+        raise AssertionError("compare_databases must not call move")
+
+    def _start_listening(self) -> None:
+        raise AssertionError("compare_databases must not register listeners")
+
+
+def _memory_db(contents: dict[bytes, set[bytes]]) -> InMemoryExampleDatabase:
+    db = InMemoryExampleDatabase()
+    for key, values in contents.items():
+        for value in values:
+            db.save(key, value)
+    return db
+
+
+def test_compare_databases_reports_left_right_and_common_examples():
+    left = _memory_db({b"k": {b"a", b"b"}})
+    right = _memory_db({b"k": {b"b", b"c"}})
+
+    result = compare_databases(left, right, [b"k"])
+
+    assert isinstance(result, DatabaseComparison)
+    assert result.keys == (b"k",)
+    (comparison,) = result
+    assert isinstance(comparison, KeyComparison)
+    assert comparison.key == b"k"
+    assert comparison.left_only == (b"a",)
+    assert comparison.right_only == (b"c",)
+    assert comparison.common == (b"b",)
+    assert comparison.left_only_count == 1
+    assert comparison.right_only_count == 1
+    assert comparison.common_count == 1
+    assert result.for_key(b"k") == comparison
+
+
+def test_compare_databases_sorts_and_deduplicates_keys_and_examples():
+    left = _memory_db({b"z": {b"c", b"a"}, b"a": {b"b", b"a", b"c"}})
+    right = _memory_db({b"a": {b"b"}})
+
+    result = compare_databases(left, right, [b"z", b"a", b"", b"a", b"z"])
+
+    assert result.keys == (b"", b"a", b"z")
+    assert [comparison.key for comparison in result] == [b"", b"a", b"z"]
+    assert result.for_key(b"a").common == (b"b",)
+    assert result.for_key(b"a").left_only == (b"a", b"c")
+    assert result.for_key(b"z").left_only == (b"a", b"c")
+    assert result.for_key(b"").common == ()
+
+
+def test_compare_databases_empty_keys_returns_empty_result():
+    db = InMemoryExampleDatabase()
+    result = compare_databases(db, db, [])
+    assert isinstance(result, DatabaseComparison)
+    assert result.keys == ()
+    assert result.comparisons == ()
+    assert len(result) == 0
+    assert list(result) == []
+
+
+def test_compare_databases_with_missing_keys():
+    left = _memory_db({b"present": {b"a"}})
+    right = _memory_db({})
+    (comparison,) = compare_databases(left, right, [b"missing"])
+    assert comparison.key == b"missing"
+    assert comparison.left_only == ()
+    assert comparison.right_only == ()
+    assert comparison.common == ()
+    assert comparison.common_count == 0
+
+
+def test_compare_databases_same_database_only_has_common_examples():
+    db = _memory_db({b"k": {b"a", b"b", b"c"}})
+
+    result = compare_databases(db, db, [b"k", b"missing"])
+
+    assert result.for_key(b"k").left_only == ()
+    assert result.for_key(b"k").right_only == ()
+    assert result.for_key(b"k").common == (b"a", b"b", b"c")
+    assert result.for_key(b"k").common_count == 3
+    assert result.for_key(b"missing").common == ()
+
+    # the identical database object is fetched at most once per key
+    scripted = ScriptedExampleDatabase({b"k": [b"a", b"b"], b"missing": []})
+    compare_databases(scripted, scripted, [b"k", b"missing", b"k"])
+    assert scripted.fetched_keys == [b"k", b"missing"]
+
+
+def test_compare_databases_is_read_only():
+    left = ScriptedExampleDatabase({b"k1": [b"a"], b"k2": [b"b"]})
+    right = ScriptedExampleDatabase({b"k1": [b"a", b"c"]})
+
+    result = compare_databases(left, right, [b"k2", b"k1", b"k2"])
+
+    assert left.mutating_calls == []
+    assert right.mutating_calls == []
+    # repeated keys are fetched at most once from each side
+    assert left.fetched_keys == [b"k1", b"k2"]
+    assert right.fetched_keys == [b"k1", b"k2"]
+    assert result.for_key(b"k1").common == (b"a",)
+    assert result.for_key(b"k1").right_only == (b"c",)
+    assert result.for_key(b"k2").left_only == (b"b",)
+
+
+def test_compare_databases_works_with_readonly_wrapper():
+    inner = _memory_db({b"k": {b"a", b"b"}})
+    left = ReadOnlyDatabase(inner)
+    right = _memory_db({b"k": {b"b"}})
+
+    result = compare_databases(left, right, [b"k"])
+
+    assert result.for_key(b"k").left_only == (b"a",)
+    assert result.for_key(b"k").common == (b"b",)
+    # the wrapped database was not modified
+    assert set(inner.fetch(b"k")) == {b"a", b"b"}
+
+
+def test_compare_databases_works_with_multiplexed_database():
+    backend1 = _memory_db({b"k1": {b"left-only"}, b"k2": {b"shared"}})
+    backend2 = _memory_db({b"k2": {b"shared", b"multi-only"}, b"k3": {b"ignored"}})
+    left = MultiplexedDatabase(backend1, backend2)
+    right = _memory_db({b"k2": {b"shared"}})
+
+    result = compare_databases(left, right, [b"k1", b"k2"])
+
+    assert result.keys == (b"k1", b"k2")
+    assert result.for_key(b"k1").left_only == (b"left-only",)
+    # b"shared" is duplicated across the multiplexed backends, but values are
+    # deduplicated by their byte contents
+    assert result.for_key(b"k2").left_only == (b"multi-only",)
+    assert result.for_key(b"k2").common == (b"shared",)
+    # keys which are not requested are never enumerated
+    assert result.for_key(b"k1").right_only == ()
+
+
+def test_compare_databases_handles_empty_key_and_value():
+    left = _memory_db({b"": {b"", b"x"}})
+    right = _memory_db({b"": {b""}})
+
+    (comparison,) = compare_databases(left, right, [b""])
+
+    assert comparison.key == b""
+    assert comparison.left_only == (b"x",)
+    assert comparison.right_only == ()
+    assert comparison.common == (b"",)
+
+
+def test_compare_databases_deduplicates_values():
+    left = ScriptedExampleDatabase({b"k": [b"a", b"a", b"b", b"a"]})
+    right = ScriptedExampleDatabase({b"k": [b"b", b"b", b"c", b"c"]})
+
+    comparison = compare_databases(left, right, [b"k"]).for_key(b"k")
+
+    assert comparison.left_only == (b"a",)
+    assert comparison.right_only == (b"c",)
+    assert comparison.common == (b"b",)
+    assert comparison.left_only_count == 1
+    assert comparison.right_only_count == 1
+    assert comparison.common_count == 1
+
+
+def test_compare_databases_ignores_fetch_enumeration_order():
+    left = ScriptedExampleDatabase({b"k": [b"c", b"a", b"b"]})
+    right = ScriptedExampleDatabase({b"k": [b"b", b"c", b"a"]})
+
+    comparison = compare_databases(left, right, [b"k"]).for_key(b"k")
+
+    assert comparison.left_only == ()
+    assert comparison.right_only == ()
+    assert comparison.common == (b"a", b"b", b"c")
+
+
+@skipif_threading
+def test_compare_databases_directory_databases(tmp_path):
+    left_db = DirectoryBasedExampleDatabase(tmp_path / "left")
+    right_db = DirectoryBasedExampleDatabase(tmp_path / "right")
+    left_db.save(b"k", b"a")
+    left_db.save(b"k", b"b")
+    right_db.save(b"k", b"b")
+    right_db.save(b"k", b"c")
+
+    # comparing through ReadOnlyDatabase wrappers must not touch either store
+    result = compare_databases(
+        ReadOnlyDatabase(left_db), ReadOnlyDatabase(right_db), [b"k"]
+    )
+
+    comparison = result.for_key(b"k")
+    assert comparison.left_only == (b"a",)
+    assert comparison.right_only == (b"c",)
+    assert comparison.common == (b"b",)
+    assert set(left_db.fetch(b"k")) == {b"a", b"b"}
+    assert set(right_db.fetch(b"k")) == {b"b", b"c"}
+
+
+class ExplodingExampleDatabase(ExampleDatabase):
+    """Fetches raise immediately (when called) for a single key."""
+
+    def __init__(self, fail_key: bytes, error: Exception) -> None:
+        super().__init__()
+        self.fail_key = fail_key
+        self.error = error
+
+    def fetch(self, key: bytes) -> Iterable[bytes]:
+        if key == self.fail_key:
+            raise self.error
+        return ()
+
+    def save(self, key: bytes, value: bytes) -> None:
+        raise AssertionError("compare_databases must not call save")
+
+    def delete(self, key: bytes, value: bytes) -> None:
+        raise AssertionError("compare_databases must not call delete")
+
+
+class LazyExplodingExampleDatabase(ExampleDatabase):
+    """Fetches only raise partway through iteration for a single key."""
+
+    def __init__(self, fail_key: bytes, error: Exception) -> None:
+        super().__init__()
+        self.fail_key = fail_key
+        self.error = error
+
+    def fetch(self, key: bytes) -> Iterable[bytes]:
+        yield b"partial-value"
+        if key == self.fail_key:
+            raise self.error
+
+    def save(self, key: bytes, value: bytes) -> None:
+        raise AssertionError("compare_databases must not call save")
+
+    def delete(self, key: bytes, value: bytes) -> None:
+        raise AssertionError("compare_databases must not call delete")
+
+
+def test_compare_databases_failure_on_left_identifies_key_and_side():
+    original = OSError("disk on fire")
+    left = ExplodingExampleDatabase(b"bad", original)
+    right = InMemoryExampleDatabase()
+
+    with pytest.raises(DatabaseComparisonError) as exc_info:
+        compare_databases(left, right, [b"good", b"bad"])
+
+    error = exc_info.value
+    assert isinstance(error, HypothesisException)
+    assert error.key == b"bad"
+    assert error.side == "left"
+    assert error.original_error is original
+    assert error.__cause__ is original
+    message = str(error)
+    assert repr(b"bad") in message
+    assert "left" in message
+    assert "OSError" in message
+
+
+def test_compare_databases_failure_on_right_identifies_key_and_side():
+    original = RuntimeError("network down")
+    left = InMemoryExampleDatabase()
+    right = ExplodingExampleDatabase(b"bad", original)
+
+    with pytest.raises(DatabaseComparisonError) as exc_info:
+        compare_databases(left, right, [b"good", b"bad"])
+
+    error = exc_info.value
+    assert error.key == b"bad"
+    assert error.side == "right"
+    assert error.original_error is original
+    assert error.__cause__ is original
+    assert "right" in str(error)
+
+
+def test_compare_databases_failure_during_iteration_is_wrapped():
+    original = ValueError("truncated stream")
+    left = InMemoryExampleDatabase()
+    right = LazyExplodingExampleDatabase(b"bad", original)
+
+    with pytest.raises(DatabaseComparisonError) as exc_info:
+        compare_databases(left, right, [b"bad"])
+
+    error = exc_info.value
+    assert error.key == b"bad"
+    assert error.side == "right"
+    assert error.original_error is original
+    assert error.__cause__ is original
+
+
+def test_compare_databases_failure_returns_no_partial_result():
+    # the left database would give a usable comparison for b"good", but the
+    # right database cannot read b"bad"; no result object must be returned.
+    left = ScriptedExampleDatabase({b"good": [b"a"]})
+    right = ExplodingExampleDatabase(b"bad", RuntimeError("boom"))
+
+    with pytest.raises(DatabaseComparisonError):
+        compare_databases(left, right, [b"good", b"bad"])
+
+    assert left.mutating_calls == []
+
+
+@given(st.data())
+@settings(max_examples=50)
+def test_compare_databases_matches_set_semantics(data):
+    left_contents = data.draw(
+        st.dictionaries(st.binary(), st.sets(st.binary(), max_size=15), max_size=10)
+    )
+    right_contents = data.draw(
+        st.dictionaries(st.binary(), st.sets(st.binary(), max_size=15), max_size=10)
+    )
+    keys = data.draw(st.lists(st.binary(), max_size=25))
+
+    left = _memory_db(left_contents)
+    right = _memory_db(right_contents)
+
+    result = compare_databases(left, right, keys)
+
+    expected_keys = tuple(sorted(set(keys)))
+    assert result.keys == expected_keys
+    assert len(result) == len(expected_keys)
+    assert isinstance(result.comparisons, tuple)
+
+    for comparison in result:
+        left_values = left_contents.get(comparison.key, set())
+        right_values = right_contents.get(comparison.key, set())
+        assert comparison.left_only == tuple(sorted(left_values - right_values))
+        assert comparison.right_only == tuple(sorted(right_values - left_values))
+        assert comparison.common == tuple(sorted(left_values & right_values))
+        assert comparison.left_only_count == len(comparison.left_only)
+        assert comparison.right_only_count == len(comparison.right_only)
+        assert comparison.common_count == len(comparison.common)
+        assert result.for_key(comparison.key) == comparison
+
+    sentinel = b"this-key-was-not-drawn"
+    if sentinel not in set(keys):
+        with pytest.raises(KeyError):
+            result.for_key(sentinel)

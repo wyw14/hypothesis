@@ -196,6 +196,14 @@ Database
 .. autoclass:: hypothesis.database.BackgroundWriteDatabase
 .. autoclass:: hypothesis.extra.redis.RedisExampleDatabase
 
+.. autofunction:: hypothesis.database.compare_databases
+.. autoclass:: hypothesis.database.DatabaseComparison
+    :members:
+.. autoclass:: hypothesis.database.KeyComparison
+    :members:
+.. autoclass:: hypothesis.database.DatabaseComparisonError
+    :members:
+
 .. _stateful:
 
 Stateful tests

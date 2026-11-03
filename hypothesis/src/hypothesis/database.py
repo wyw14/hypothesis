@@ -17,7 +17,8 @@ import sys
 import tempfile
 import warnings
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from hashlib import sha384
@@ -42,12 +43,16 @@ from hypothesis.utils.conventions import UniqueIdentifier, not_set
 from hypothesis.utils.deprecation import note_deprecation
 
 __all__ = [
+    "DatabaseComparison",
+    "DatabaseComparisonError",
     "DirectoryBasedExampleDatabase",
     "ExampleDatabase",
     "GitHubArtifactDatabase",
     "InMemoryExampleDatabase",
+    "KeyComparison",
     "MultiplexedDatabase",
     "ReadOnlyDatabase",
+    "compare_databases",
 ]
 
 if TYPE_CHECKING:
@@ -361,6 +366,175 @@ class ExampleDatabase(metaclass=_EDMeta):
             HypothesisWarning,
             stacklevel=4,
         )
+
+
+class DatabaseComparisonError(HypothesisException):
+    """Raised by :func:`~hypothesis.database.compare_databases` when the
+    examples for a key could not be fetched from one of the two databases.
+
+    The key being compared is available as :attr:`key`, and the side whose
+    database failed to fetch it as :attr:`side` (``"left"`` or ``"right"``).
+    The original exception is preserved as :attr:`original_error` (and as
+    ``__cause__``); because the comparison cannot be completed, no partial
+    result is returned.
+    """
+
+    def __init__(self, key: bytes, side: str, original_error: BaseException) -> None:
+        self.key = key
+        self.side = side
+        self.original_error = original_error
+        super().__init__(
+            f"Failed to fetch the examples for key {key!r} from the {side} "
+            f"database; {type(original_error).__name__}: {original_error}"
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class KeyComparison:
+    """The comparison of the examples stored under a single :attr:`key` in the
+    two databases passed to :func:`~hypothesis.database.compare_databases`.
+
+    Values are deduplicated by their byte contents and sorted in byte order:
+
+    * :attr:`left_only` contains the examples found only in the left database,
+    * :attr:`right_only` contains the examples found only in the right database,
+    * :attr:`common` contains the examples found in both databases.
+
+    The matching counts are available as :attr:`left_only_count`,
+    :attr:`right_only_count`, and :attr:`common_count`.
+    """
+
+    key: bytes
+    left_only: tuple[bytes, ...]
+    right_only: tuple[bytes, ...]
+    common: tuple[bytes, ...]
+
+    @property
+    def left_only_count(self) -> int:
+        """The number of examples found only in the left database."""
+        return len(self.left_only)
+
+    @property
+    def right_only_count(self) -> int:
+        """The number of examples found only in the right database."""
+        return len(self.right_only)
+
+    @property
+    def common_count(self) -> int:
+        """The number of examples found in both databases."""
+        return len(self.common)
+
+
+@dataclass(slots=True, frozen=True)
+class DatabaseComparison:
+    """The result of :func:`~hypothesis.database.compare_databases`.
+
+    :attr:`comparisons` contains one :class:`KeyComparison` per distinct
+    requested key, sorted by key in byte order. Iterating over a
+    :class:`DatabaseComparison` yields its :class:`KeyComparison` entries, and
+    :meth:`for_key` looks up the entry for an individual key. An empty set of
+    requested keys produces an empty comparison.
+    """
+
+    comparisons: tuple[KeyComparison, ...]
+
+    @property
+    def keys(self) -> tuple[bytes, ...]:
+        """The compared keys, deduplicated and sorted in byte order."""
+        return tuple(comparison.key for comparison in self.comparisons)
+
+    def for_key(self, key: bytes) -> KeyComparison:
+        """Return the :class:`KeyComparison` for ``key``.
+
+        Raises ``KeyError`` if ``key`` was not part of the comparison.
+        """
+        for comparison in self.comparisons:
+            if comparison.key == key:
+                return comparison
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[KeyComparison]:
+        return iter(self.comparisons)
+
+    def __len__(self) -> int:
+        return len(self.comparisons)
+
+
+def _fetch_values(db: ExampleDatabase, key: bytes, side: str) -> set[bytes]:
+    # Fetch and materialize eagerly, so that a generator-backed fetch which
+    # fails while being iterated is reported in the same way as one which
+    # fails when called.
+    try:
+        return set(db.fetch(key))
+    except DatabaseComparisonError:
+        raise
+    except Exception as err:
+        raise DatabaseComparisonError(key, side, err) from err
+
+
+def compare_databases(
+    left: ExampleDatabase,
+    right: ExampleDatabase,
+    keys: Iterable[bytes],
+) -> DatabaseComparison:
+    """Compare the examples stored under ``keys`` in two databases.
+
+    This is a read-only operation: for each key it only calls
+    :meth:`ExampleDatabase.fetch` on each database. It never calls
+    :meth:`~ExampleDatabase.save`, :meth:`~ExampleDatabase.delete`,
+    :meth:`~ExampleDatabase.move`, or the change-listening methods, and it does
+    not assume that the databases can enumerate all of their keys.
+
+    For each key the fetched values are deduplicated by their byte contents and
+    split into examples found only in ``left``, only in ``right``, or in both
+    databases. Duplicate keys are compared only once. Keys and example values
+    are sorted in byte order, so the result does not depend on the order in
+    which a database enumerates its values. An empty iterable of ``keys``
+    returns an empty :class:`DatabaseComparison`.
+
+    If the same database object is passed as both ``left`` and ``right``, it
+    is fetched once per key and every example is reported as common.
+
+    .. note::
+
+        Each key is read independently from each database. If another process
+        or thread writes to either database while the comparison is running,
+        the result reflects a sequence of per-key reads rather than a single
+        atomic snapshot across all keys.
+
+    If fetching a key from either database raises, a
+    :class:`DatabaseComparisonError` is raised identifying the key and the
+    failing side (``"left"`` or ``"right"``), with the original exception
+    preserved as its cause. No partial comparison result is returned.
+    """
+    assert isinstance(left, ExampleDatabase)
+    assert isinstance(right, ExampleDatabase)
+
+    # bytes are hashable, so this both deduplicates repeated keys and gives us
+    # a stable byte-wise ordering for the result.
+    ordered_keys = sorted(set(keys))
+
+    comparisons: list[KeyComparison] = []
+    for key in ordered_keys:
+        if left is right:
+            # Reading the same database twice could disagree under concurrent
+            # writes; fetch it once and treat all of its values as common.
+            left_values = right_values = _fetch_values(left, key, "left")
+        else:
+            left_values = _fetch_values(left, key, "left")
+            right_values = _fetch_values(right, key, "right")
+
+        common = left_values & right_values
+        comparisons.append(
+            KeyComparison(
+                key=key,
+                left_only=tuple(sorted(left_values - common)),
+                right_only=tuple(sorted(right_values - common)),
+                common=tuple(sorted(common)),
+            )
+        )
+
+    return DatabaseComparison(tuple(comparisons))
 
 
 class InMemoryExampleDatabase(ExampleDatabase):
