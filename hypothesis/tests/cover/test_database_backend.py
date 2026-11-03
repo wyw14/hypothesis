@@ -14,6 +14,7 @@ import shutil
 import tempfile
 import time
 import zipfile
+import zlib
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, nullcontext
@@ -32,7 +33,9 @@ from hypothesis import (
     strategies as st,
 )
 from hypothesis.database import (
+    _COMPRESSED_VALUE_PREFIX,
     BackgroundWriteDatabase,
+    CompressedExampleDatabase,
     DirectoryBasedExampleDatabase,
     ExampleDatabase,
     GitHubArtifactDatabase,
@@ -46,7 +49,11 @@ from hypothesis.database import (
     choices_from_bytes,
     choices_to_bytes,
 )
-from hypothesis.errors import HypothesisDeprecationWarning, HypothesisWarning
+from hypothesis.errors import (
+    HypothesisDeprecationWarning,
+    HypothesisWarning,
+    InvalidArgument,
+)
 from hypothesis.internal.compat import WINDOWS
 from hypothesis.internal.conjecture.choice import choice_equal
 from hypothesis.stateful import (
@@ -524,6 +531,277 @@ def test_background_write_database():
     assert set(db.fetch(b"a")) == {b"d"}
 
 
+@pytest.fixture(params=["memory", "directory"])
+def compressed_pair(request, tmp_path):
+    if request.param == "memory":
+        inner = InMemoryExampleDatabase()
+    else:
+        inner = DirectoryBasedExampleDatabase(tmp_path / "compressed-examples")
+    return CompressedExampleDatabase(inner), inner
+
+
+@skipif_threading
+def test_compressed_database_roundtrips(compressed_pair):
+    db, inner = compressed_pair
+    key = b"some test key"
+    short = b"short"
+    compressible = b"a" * 10_000
+    # high-entropy data which zlib cannot make smaller
+    incompressible = os.urandom(2000)
+
+    db.save(key, short)
+    db.save(key, compressible)
+    db.save(key, incompressible)
+
+    assert set(db.fetch(key)) == {short, compressible, incompressible}
+
+    stored = set(inner.fetch(key))
+    # short and incompressible values are saved in their original form
+    assert short in stored
+    assert incompressible in stored
+    # the large, compressible value is actually compressed on disk
+    assert compressible not in stored
+    (compressed_entry,) = (v for v in stored if v.startswith(_COMPRESSED_VALUE_PREFIX))
+    assert len(compressed_entry) < len(compressible)
+    assert (
+        zlib.decompress(compressed_entry[len(_COMPRESSED_VALUE_PREFIX) :])
+        == compressible
+    )
+
+
+def test_compressed_database_respects_min_size():
+    value = b"a" * 100
+
+    db = CompressedExampleDatabase(InMemoryExampleDatabase(), min_size=200)
+    db.save(b"k", value)
+    assert set(db._db.fetch(b"k")) == {value}
+
+    db = CompressedExampleDatabase(InMemoryExampleDatabase(), min_size=10)
+    db.save(b"k", value)
+    (stored,) = db._db.fetch(b"k")
+    assert stored.startswith(_COMPRESSED_VALUE_PREFIX)
+    assert set(db.fetch(b"k")) == {value}
+
+
+def test_compressed_database_min_size_zero():
+    db = CompressedExampleDatabase(InMemoryExampleDatabase(), min_size=0)
+    # compression can't make these smaller, so they stay raw even at min_size=0
+    db.save(b"empty", b"")
+    assert set(db._db.fetch(b"empty")) == {b""}
+    db.save(b"tiny", b"aaaa")
+    assert set(db._db.fetch(b"tiny")) == {b"aaaa"}
+    # a compressible value is still compressed
+    db.save(b"big", b"a" * 100)
+    (stored,) = db._db.fetch(b"big")
+    assert stored.startswith(_COMPRESSED_VALUE_PREFIX)
+
+
+@skipif_threading
+def test_compressed_database_deduplicates(compressed_pair):
+    db, inner = compressed_pair
+    value = b"a" * 5000
+
+    for _ in range(3):
+        db.save(b"k", value)
+
+    assert set(inner.fetch(b"k")) == {_COMPRESSED_VALUE_PREFIX + zlib.compress(value)}
+    assert list(db.fetch(b"k")) == [value]
+
+
+def test_compressed_database_dedups_both_forms():
+    value = b"a" * 5000
+    inner = InMemoryExampleDatabase()
+    # the same original value, once raw and once compressed (e.g. saved with a
+    # different min_size), comes back a single time
+    inner.save(b"k", value)
+    inner.save(b"k", _COMPRESSED_VALUE_PREFIX + zlib.compress(value))
+    assert set(CompressedExampleDatabase(inner).fetch(b"k")) == {value}
+
+    inner = InMemoryExampleDatabase()
+    CompressedExampleDatabase(inner, min_size=10_000).save(b"k", value)
+    CompressedExampleDatabase(inner, min_size=10).save(b"k", value)
+    assert len(set(inner.fetch(b"k"))) == 2
+    assert set(CompressedExampleDatabase(inner).fetch(b"k")) == {value}
+
+
+@skipif_threading
+def test_compressed_database_reads_both_forms_after_reopen(tmp_path):
+    db1 = CompressedExampleDatabase(DirectoryBasedExampleDatabase(tmp_path))
+    short = b"tiny"
+    compressible = b"ab" * 5000
+    db1.save(b"k", short)
+    db1.save(b"k", compressible)
+    # a value written directly, with no wrapper, must remain readable as-is
+    DirectoryBasedExampleDatabase(tmp_path).save(b"k", b"written directly")
+
+    db2 = CompressedExampleDatabase(DirectoryBasedExampleDatabase(tmp_path))
+    assert set(db2.fetch(b"k")) == {short, compressible, b"written directly"}
+
+
+@skipif_threading
+def test_compressed_database_skips_corrupt_entries(compressed_pair):
+    db, inner = compressed_pair
+    key = b"k"
+    good_raw = b"plain raw value"
+    good_compressed = b"z" * 500
+    valid_stored = _COMPRESSED_VALUE_PREFIX + zlib.compress(good_compressed)
+    truncated = valid_stored[:-10]
+
+    inner.save(key, good_raw)
+    inner.save(key, valid_stored)
+    inner.save(key, _COMPRESSED_VALUE_PREFIX + b"this is not a zlib stream")
+    inner.save(key, truncated)
+
+    # corrupt entries are never returned as test inputs, but the valid entries
+    # under the same key are still read
+    assert set(db.fetch(key)) == {good_raw, good_compressed}
+    assert list(db.fetch(b"no such key")) == []
+
+
+@skipif_threading
+def test_compressed_database_delete_and_move(compressed_pair):
+    db, inner = compressed_pair
+    short, big = b"short", b"a" * 5000
+    db.save(b"k", short)
+    db.save(b"k", big)
+
+    # delete takes the uncompressed value and removes the compressed storage
+    db.delete(b"k", big)
+    assert set(db.fetch(b"k")) == {short}
+    assert set(inner.fetch(b"k")) == {short}
+    # deleting an absent value is silently a no-op
+    db.delete(b"k", big)
+
+    # move presents uncompressed values on both sides
+    db.move(b"k", b"k2", short)
+    assert set(db.fetch(b"k")) == set()
+    assert set(db.fetch(b"k2")) == {short}
+
+    # moving within the same key behaves like a save
+    db.move(b"k2", b"k2", big)
+    assert set(db.fetch(b"k2")) == {short, big}
+
+    # moving a compressed value moves the compressed entry, not a raw copy
+    db.move(b"k2", b"k", big)
+    assert set(db.fetch(b"k2")) == {short}
+    assert set(db.fetch(b"k")) == {big}
+    (big_stored,) = inner.fetch(b"k")
+    assert big_stored.startswith(_COMPRESSED_VALUE_PREFIX)
+    assert zlib.decompress(big_stored[len(_COMPRESSED_VALUE_PREFIX) :]) == big
+
+
+def test_compressed_database_listener_translates_events():
+    inner = InMemoryExampleDatabase()
+    db = CompressedExampleDatabase(inner)
+    events = []
+    db.add_listener(events.append)
+
+    small, big = b"short", b"a" * 5000
+    db.save(b"k", big)
+    assert events == [("save", (b"k", big))]
+    # listeners see uncompressed bytes; the wrapped database stored compressed
+    assert big not in inner.data[b"k"]
+    assert next(iter(inner.data[b"k"])).startswith(_COMPRESSED_VALUE_PREFIX)
+
+    # saving the same value again duplicates neither storage nor events
+    db.save(b"k", big)
+    assert events == [("save", (b"k", big))]
+
+    db.save(b"k", small)
+    assert events[-1] == ("save", (b"k", small))
+
+    db.delete(b"k", big)
+    assert events[-1] == ("delete", (b"k", big))
+
+    db.move(b"k", b"k2", small)
+    assert events[-2:] == [
+        ("delete", (b"k", small)),
+        ("save", (b"k2", small)),
+    ]
+
+    db.remove_listener(events.append)
+    assert inner._listeners == []
+
+
+def test_compressed_database_listener_passthrough_and_corruption():
+    inner = InMemoryExampleDatabase()
+    db = CompressedExampleDatabase(inner)
+    events = []
+    db.add_listener(events.append)
+
+    # raw values written straight to the wrapped database pass through unchanged
+    inner.save(b"k", b"direct raw")
+    assert events[-1] == ("save", (b"k", b"direct raw"))
+
+    # a value that looks compressed but is corrupt is not broadcast as a save
+    corrupt = _COMPRESSED_VALUE_PREFIX + b"junk"
+    inner.save(b"k", corrupt)
+    assert events[-1] == ("save", (b"k", b"direct raw"))
+
+    # deleting it still reports the deletion, but without a decodable value
+    inner.delete(b"k", corrupt)
+    assert events[-1] == ("delete", (b"k", None))
+
+    # delete events that already carry None (e.g. external file deletion) stay None
+    db._translate_change(("delete", (b"k", None)))
+    assert events[-1] == ("delete", (b"k", None))
+
+
+@skipif_threading
+def test_compressed_database_preserves_keys_and_direct_data(tmp_path):
+    inner = DirectoryBasedExampleDatabase(tmp_path)
+    db = CompressedExampleDatabase(inner)
+
+    db.save(b"k1", b"a" * 5000)
+    # keys are forwarded to the wrapped database unchanged
+    assert inner._key_path(b"k1").name == _hash(b"k1")
+
+    # data written directly to the wrapped database is untouched and readable,
+    # even alongside compressed entries under the same key
+    inner.save(b"k1", b"direct")
+    inner.save(b"k2", b"other key value")
+    assert set(db.fetch(b"k1")) == {b"a" * 5000, b"direct"}
+    assert set(db.fetch(b"k2")) == {b"other key value"}
+
+    # the wrapper introduced no keys of its own
+    assert set(inner.fetch(inner._metakeys_name)) == {b"k1", b"k2"}
+
+
+def test_compressed_database_repr_and_equality():
+    inner = InMemoryExampleDatabase()
+    db = CompressedExampleDatabase(inner)
+    assert type(db).__name__ in repr(db)
+    assert "min_size=100" in repr(db)
+    assert db == CompressedExampleDatabase(inner)
+    assert db != CompressedExampleDatabase(inner, min_size=10)
+    assert db != InMemoryExampleDatabase()
+
+
+@pytest.mark.parametrize("min_size", [-1, 1.5, True, "100"])
+def test_compressed_database_validates_min_size(min_size):
+    with pytest.raises(InvalidArgument):
+        CompressedExampleDatabase(InMemoryExampleDatabase(), min_size=min_size)
+
+
+def test_database_listener_compressed():
+    _database_conforms_to_listener_api(
+        lambda path: CompressedExampleDatabase(InMemoryExampleDatabase()),
+        parent_settings=settings(max_examples=5, stateful_step_count=10),
+    )
+
+
+@given(lists(tuples(binary(), binary())))
+@settings(max_examples=25)
+def test_compressed_database_agrees_with_memory(xs):
+    reference = InMemoryExampleDatabase()
+    db = CompressedExampleDatabase(InMemoryExampleDatabase(), min_size=0)
+    for key, value in xs:
+        reference.save(key, value)
+        db.save(key, value)
+    for key in {key for key, _ in xs}:
+        assert set(db.fetch(key)) == set(reference.fetch(key))
+
+
 @given(lists(nodes()))
 # covering examples
 @example(nodes_inline(True))
@@ -869,6 +1147,10 @@ def test_deprecated_example_database_no_args():
             ReadOnlyDatabase(DirectoryBasedExampleDatabase("a")),
         ),
         (
+            CompressedExampleDatabase(DirectoryBasedExampleDatabase("a")),
+            CompressedExampleDatabase(DirectoryBasedExampleDatabase("a")),
+        ),
+        (
             GitHubArtifactDatabase("owner1", "repo1"),
             GitHubArtifactDatabase("owner1", "repo1"),
         ),
@@ -888,6 +1170,14 @@ def test_database_equal(db1, db2):
         (
             ReadOnlyDatabase(DirectoryBasedExampleDatabase("a")),
             ReadOnlyDatabase(DirectoryBasedExampleDatabase("b")),
+        ),
+        (
+            CompressedExampleDatabase(DirectoryBasedExampleDatabase("a")),
+            CompressedExampleDatabase(DirectoryBasedExampleDatabase("b")),
+        ),
+        (
+            CompressedExampleDatabase(InMemoryExampleDatabase()),
+            CompressedExampleDatabase(InMemoryExampleDatabase(), min_size=10),
         ),
         (
             GitHubArtifactDatabase("owner1", "repo1"),

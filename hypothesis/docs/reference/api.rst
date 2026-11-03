@@ -194,6 +194,7 @@ Database
 .. autoclass:: hypothesis.database.ReadOnlyDatabase
 .. autoclass:: hypothesis.database.MultiplexedDatabase
 .. autoclass:: hypothesis.database.BackgroundWriteDatabase
+.. autoclass:: hypothesis.database.CompressedExampleDatabase
 .. autoclass:: hypothesis.extra.redis.RedisExampleDatabase
 
 .. _stateful:

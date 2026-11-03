@@ -17,6 +17,7 @@ import sys
 import tempfile
 import warnings
 import weakref
+import zlib
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -36,12 +37,13 @@ from typing import (
 from zipfile import BadZipFile, ZipFile
 
 from hypothesis.configuration import StorageDirectory, storage_directory
-from hypothesis.errors import HypothesisException, HypothesisWarning
+from hypothesis.errors import HypothesisException, HypothesisWarning, InvalidArgument
 from hypothesis.internal.conjecture.choice import ChoiceT
 from hypothesis.utils.conventions import UniqueIdentifier, not_set
 from hypothesis.utils.deprecation import note_deprecation
 
 __all__ = [
+    "CompressedExampleDatabase",
     "DirectoryBasedExampleDatabase",
     "ExampleDatabase",
     "GitHubArtifactDatabase",
@@ -1227,6 +1229,135 @@ class BackgroundWriteDatabase(ExampleDatabase):
 
     def _stop_listening(self) -> None:
         self._db.remove_listener(self._broadcast_change)
+
+
+# Values in the wrapped database that begin with this marker are stored
+# zlib-compressed; every other value is stored (and returned) verbatim. The
+# marker is deliberately long and unusual looking, so that arbitrary example
+# bytes are vanishingly unlikely to collide with it.
+_COMPRESSED_VALUE_PREFIX = b"\x00hypothesis-compressed-value\x00"
+
+# Sentinel returned by _decode_stored_value for an entry that claims to be
+# compressed but cannot be decompressed (e.g. it was truncated or corrupted).
+_corrupt_stored_value: object = object()
+
+
+def _decode_stored_value(stored: bytes) -> bytes | object:
+    if not stored.startswith(_COMPRESSED_VALUE_PREFIX):
+        return stored
+    try:
+        return zlib.decompress(stored[len(_COMPRESSED_VALUE_PREFIX) :])
+    except zlib.error:
+        return _corrupt_stored_value
+
+
+class CompressedExampleDatabase(ExampleDatabase):
+    """A wrapper which transparently compresses values in the wrapped database.
+
+    Large failing examples can take up a lot of space when they are saved to
+    disk. Values saved through this database are compressed with zlib whenever
+    doing so makes them smaller, while :meth:`fetch`, :meth:`delete`,
+    :meth:`move`, and change listeners always present the original,
+    uncompressed bytes.
+
+    Only values of at least ``min_size`` bytes are considered for compression.
+    Short values, and values for which compression would not save any space,
+    are saved to the wrapped database exactly as given. Compression is likewise
+    transparent on the way back out: values stored in either form - including
+    by an older version of this wrapper - are decompressed as needed, and the
+    same original value is never returned twice even if both forms are present.
+
+    Keys are never modified, so values written directly to the wrapped database
+    remain accessible and are returned unchanged. If a stored value claims to be
+    compressed but cannot be decompressed (for example because it was truncated
+    or otherwise corrupted), it is skipped by :meth:`fetch` instead of being
+    returned, and the other values under that key can still be read.
+    """
+
+    def __init__(self, db: ExampleDatabase, min_size: int = 100) -> None:
+        super().__init__()
+        assert isinstance(db, ExampleDatabase)
+        if not isinstance(min_size, int) or isinstance(min_size, bool) or min_size < 0:
+            raise InvalidArgument(
+                f"min_size must be a non-negative integer, got {min_size!r}"
+            )
+        self._db = db
+        self.min_size = min_size
+
+    def __repr__(self) -> str:
+        return f"CompressedExampleDatabase({self._db!r}, min_size={self.min_size})"
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, CompressedExampleDatabase)
+            and self._db == other._db
+            and self.min_size == other.min_size
+        )
+
+    def _encode(self, value: bytes) -> bytes:
+        if len(value) >= self.min_size:
+            stored = _COMPRESSED_VALUE_PREFIX + zlib.compress(value)
+            # Only store compressed if it is actually smaller, so that
+            # incompressible values don't grow on disk.
+            if len(stored) < len(value):
+                return stored
+        return value
+
+    def save(self, key: bytes, value: bytes) -> None:
+        self._db.save(key, self._encode(value))
+
+    def fetch(self, key: bytes) -> Iterable[bytes]:
+        # Dedup in case the same original value was saved in both forms (e.g.
+        # with different min_size settings) or written directly as well.
+        seen: set[bytes] = set()
+        for stored in self._db.fetch(key):
+            value = _decode_stored_value(stored)
+            if value is _corrupt_stored_value:
+                continue
+            assert isinstance(value, bytes)
+            if value in seen:
+                continue
+            seen.add(value)
+            yield value
+
+    def delete(self, key: bytes, value: bytes) -> None:
+        self._db.delete(key, self._encode(value))
+
+    def move(self, src: bytes, dest: bytes, value: bytes) -> None:
+        self._db.move(src, dest, self._encode(value))
+
+    def _translate_change(self, event: ListenerEventT) -> None:
+        kind, (key, stored) = event
+        if kind == "save":
+            if stored is None:  # pragma: no cover # save events carry a value
+                return
+            value = _decode_stored_value(stored)
+            if value is not _corrupt_stored_value:
+                assert isinstance(value, bytes)
+                self._broadcast_change(("save", (key, value)))
+            # a corrupt value appearing in the wrapped database is skipped by
+            # fetch() too, so don't broadcast it.
+            return
+
+        assert kind == "delete"
+        if stored is None:
+            self._broadcast_change(("delete", (key, None)))
+            return
+
+        value = _decode_stored_value(stored)
+        if value is _corrupt_stored_value:
+            # Something unreadable disappeared: report the deletion without a
+            # value, which the listener contract explicitly allows.
+            self._broadcast_change(("delete", (key, None)))
+        else:
+            assert isinstance(value, bytes)
+            self._broadcast_change(("delete", (key, value)))
+
+    def _start_listening(self) -> None:
+        self._db.add_listener(self._translate_change)
+
+    def _stop_listening(self) -> None:
+        self._db.remove_listener(self._translate_change)
 
 
 def _pack_uleb128(value: int) -> bytes:
